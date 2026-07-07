@@ -1,0 +1,25 @@
+# Visual Studio 빌드 산출물
+.vs/
+x64/
+Win32/
+Debug/
+Release/
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.exe
+*.tlog
+*.log
+*.recipe
+*.iobj
+*.ipdb
+ipch/
+
+# 사용자별 IDE 설정
+*.user
+*.suo
+*.aps
+
+# 프로파일러 출력
+profile.txt
