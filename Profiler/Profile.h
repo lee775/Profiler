@@ -2,11 +2,8 @@
 
 // 프로파일링은 기본 활성화된다.
 // 빌드 전체에서 측정 코드를 제거하려면 프로젝트 전처리기 정의에 PROFILE_DISABLE을 추가한다.
+// (게이트 토큰을 별도 #define 하지 않는다 — 흔한 이름을 소비자 TU 전역에 누출하지 않기 위함)
 #if !defined(PROFILE_DISABLE)
-#define PROFILE
-#endif
-
-#ifdef PROFILE
 #define PRO_BEGIN(TagName)	ProfileBegin(TagName)
 #define PRO_END(TagName)	ProfileEnd(TagName)
 #define PRO_PRINT()			ProfilePrint()
