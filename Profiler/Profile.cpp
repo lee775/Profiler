@@ -378,7 +378,18 @@ void ProfileDataOutText(const char* szFileName)
 	}
 	ReleaseSRWLockShared(&g_errorLock);
 
-	fclose(file);
+	// 쓰기 오류를 확인한다. fclose가 남은 버퍼를 flush하므로 그 결과도 중요하다.
+	// 디스크 꽉 참(ENOSPC) 등으로 임시 파일이 부분 기록됐다면 원자 교체를 하지 않아,
+	// 직전의 정상 리포트가 잘린 파일로 덮여 유실되는 일을 막는다.
+	const bool streamOk = (ferror(file) == 0);
+	const bool closeOk = (fclose(file) == 0);
+	if (!streamOk || !closeOk)
+	{
+		fprintf(stderr, "Profile: write to '%s' failed; keeping the previous report intact\n", tmpName);
+		DeleteFileA(tmpName);
+		ReleaseSRWLockExclusive(&g_printLock);
+		return;
+	}
 
 	// 완성된 임시 파일을 최종 파일로 원자 교체
 	if (!MoveFileExA(tmpName, szFileName, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
