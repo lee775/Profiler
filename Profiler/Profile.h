@@ -19,7 +19,7 @@
 #endif
 
 // 측정 구간 시작/종료.
-// 태그 문자열은 내부 버퍼에 복사되며(최대 63자), 측정치는 호출한 스레드별로 집계된다.
+// 태그 문자열은 내부 버퍼에 복사되며(최대 39자), 측정치는 호출한 스레드별로 집계된다.
 void ProfileBegin(const char* tag);
 void ProfileEnd(const char* tag);
 

@@ -6,15 +6,22 @@
 #include <cstdio>
 #include <cstring>
 #include <cfloat>
+#include <new>			// std::nothrow
 
 namespace
 {
 	constexpr int MAX_PROFILE_TAGS = 32;			// 스레드당 등록 가능한 태그 수
 	constexpr int MAX_TAG_LEN = 40;					// 태그 이름 최대 길이(널 포함). 보고서 Name 컬럼 폭과 동일하게 유지한다
-	constexpr int NAME_COL_W = MAX_TAG_LEN - 1;		// 저장 폭 == 표시 폭 → 잘림으로 인한 태그 혼동이 없다
 	constexpr int MAX_ERRORS = 32;					// 보고서에 남길 오류 수
 	constexpr int ERROR_MSG_LEN = 160;				// thread id + 메시지 + 태그가 잘리지 않을 크기
 	constexpr long long CALLS_FOR_OUTLIER_CUT = 5;	// 상·하위 2개씩 제외하려면 최소 5회 필요
+
+	// 보고서 컬럼 폭. 구분선/헤더/데이터 행이 모두 이 상수들로부터 만들어지므로
+	// 한 곳만 바꿔도 표 전체가 어긋나지 않는다.
+	constexpr int W_TID = 10;						// DWORD thread id 최대 10자리
+	constexpr int W_NAME = MAX_TAG_LEN - 1;			// 저장 폭 == 표시 폭 → 잘림으로 인한 태그 혼동이 없다
+	constexpr int W_NUM = 16;						// 11 정수부 + '.' + 4 소수 → 1000초(≈16분) 넘는 구간도 정렬 유지
+	constexpr int W_CALL = 12;
 
 	const char DEFAULT_FILE_NAME[] = "profile.txt";
 
@@ -43,7 +50,7 @@ namespace
 	// 락 계층(항상 이 순서로만 중첩 획득 → 데드락 방지):
 	//   g_printLock > g_registryLock > ThreadBlock::lock > g_errorLock
 	// Begin/End는 block lock만, 그리고 그 락을 푼 뒤에만 LogError(g_errorLock)를 호출한다.
-	SRWLOCK g_printLock = SRWLOCK_INIT;		// 모든 보고서 출력(자동/수동)을 직렬화해 동일 파일 동시 열기를 막는다
+	SRWLOCK g_printLock = SRWLOCK_INIT;		// 모든 보고서 출력(자동/수동)을 직렬화한다
 	SRWLOCK g_registryLock = SRWLOCK_INIT;
 	ThreadBlock* g_blockHead = nullptr;
 
@@ -97,9 +104,13 @@ namespace
 		SafeDebugBreak();
 	}
 
+	// 실패 시 nullptr을 반환한다(예외를 던지지 않는다). 프로파일링은 계측 코드이므로
+	// 메모리 부족으로 호출자 코드에 예외를 전파해 프로세스를 흔드는 것보다 이번 호출을 건너뛰는 편이 안전하다.
 	ThreadBlock* CreateThreadBlock()
 	{
-		ThreadBlock* block = new ThreadBlock{};
+		ThreadBlock* block = new (std::nothrow) ThreadBlock{};
+		if (block == nullptr)
+			return nullptr;
 		block->threadId = GetCurrentThreadId();
 		InitializeSRWLock(&block->lock);
 
@@ -113,6 +124,7 @@ namespace
 	// 이 스레드의 블록을 반환한다. 반환값이 nullptr이면 이번 호출은 프로파일링을 건너뛴다.
 	// 포인터는 0으로 상수 초기화되어 동적 초기화 가드가 없으므로, 할당 경로를
 	// 프로파일링(예: operator new 후킹)하더라도 재진입 시 무한 재귀에 빠지지 않는다.
+	// 할당이 실패해도 tlsInInit을 반드시 되돌리므로, 일시적 OOM이 그 스레드의 프로파일링을 영구히 끄지 않는다.
 	ThreadBlock* GetThreadBlock()
 	{
 		static thread_local ThreadBlock* tlsBlock = nullptr;
@@ -126,16 +138,16 @@ namespace
 		tlsInInit = true;
 		tlsBlock = CreateThreadBlock();
 		tlsInInit = false;
-		return tlsBlock;
+		return tlsBlock;			// 실패했으면 여전히 nullptr → 다음 호출에서 다시 시도한다
 	}
 
 	// block->lock을 잡은 상태에서 호출할 것.
-	// 저장 시 NAME_COL_W자로 잘리므로 비교도 같은 길이로 해야 긴 태그의 BEGIN/END가 짝을 찾는다
+	// 저장 시 W_NAME자로 잘리므로 비교도 같은 길이로 해야 긴 태그의 BEGIN/END가 짝을 찾는다
 	ProfileSample* FindSlot(ThreadBlock* block, const char* tag)
 	{
 		for (int i = 0; i < block->used; i++)
 		{
-			if (strncmp(block->slots[i].tag, tag, NAME_COL_W) == 0)
+			if (strncmp(block->slots[i].tag, tag, W_NAME) == 0)
 				return &block->slots[i];
 		}
 		return nullptr;
@@ -160,6 +172,9 @@ namespace
 
 void ProfileBegin(const char* tag)
 {
+	if (tag == nullptr)
+		tag = "(null)";			// 널 태그로 프로세스를 죽이지 않는다("오사용은 기록하되 중단 없음" 원칙)
+
 	ThreadBlock* block = GetThreadBlock();
 	if (block == nullptr)
 		return;
@@ -207,6 +222,9 @@ void ProfileEnd(const char* tag)
 	// 종료 시각을 가장 먼저 캡처해 탐색/락 비용을 측정에서 배제한다
 	LARGE_INTEGER endTime;
 	QueryPerformanceCounter(&endTime);
+
+	if (tag == nullptr)
+		tag = "(null)";
 
 	ThreadBlock* block = GetThreadBlock();
 	if (block == nullptr)
@@ -261,26 +279,36 @@ void ProfileEnd(const char* tag)
 
 void ProfileDataOutText(const char* szFileName)
 {
+	if (szFileName == nullptr)
+		szFileName = DEFAULT_FILE_NAME;
+
 	// 모든 출력을 직렬화한다: 자동 출력과 여러 스레드의 PRO_PRINT가 겹쳐도
 	// 같은 파일을 동시에 열어 한쪽 리포트가 통째로 유실되는 일이 없다.
 	AcquireSRWLockExclusive(&g_printLock);
 
+	// 임시 파일에 먼저 쓰고 원자적으로 교체한다. 출력 도중 크래시/전원 차단이 나도
+	// 직전의 정상 리포트가 파괴되지 않는다(주기적 PRO_PRINT로 중간 결과를 보존하는 용도에 필요).
+	char tmpName[512];
+	_snprintf_s(tmpName, sizeof(tmpName), _TRUNCATE, "%s.tmp", szFileName);
+
 	FILE* file = nullptr;
-	if (fopen_s(&file, szFileName, "wt") != 0 || file == nullptr)
+	if (fopen_s(&file, tmpName, "wt") != 0 || file == nullptr)
 	{
-		fprintf(stderr, "Profile: failed to open output file '%s'\n", szFileName);
+		fprintf(stderr, "Profile: failed to open output file '%s'\n", tmpName);
 		ReleaseSRWLockExclusive(&g_printLock);
 		return;
 	}
 
-	// 헤더/데이터/구분선을 같은 폭 상수로 만들어 표가 절대 어긋나지 않게 한다
-	char dash[9 + 3 + NAME_COL_W + 3 + 14 + 3 + 14 + 3 + 14 + 3 + 10 + 1];
+	// 헤더/데이터/구분선을 같은 폭 상수로 만들어 표가 어긋나지 않게 한다
+	// (일반적인 값 기준. 극단적으로 큰 값은 최소폭을 넘어설 수 있다.)
+	char dash[W_TID + 3 + W_NAME + 3 + W_NUM + 3 + W_NUM + 3 + W_NUM + 3 + W_CALL + 1];
 	memset(dash, '-', sizeof(dash) - 1);
 	dash[sizeof(dash) - 1] = '\0';
 
 	fprintf(file, "%s\n", dash);
-	fprintf(file, "%9s | %-*s | %14s | %14s | %14s | %10s\n",
-		"ThreadId", NAME_COL_W, "Name", "Average(us)", "Min(us)", "Max(us)", "Call");
+	fprintf(file, "%*s | %-*s | %*s | %*s | %*s | %*s\n",
+		W_TID, "ThreadId", W_NAME, "Name",
+		W_NUM, "Average(us)", W_NUM, "Min(us)", W_NUM, "Max(us)", W_CALL, "Call");
 	fprintf(file, "%s\n", dash);
 
 	// 블록 리스트는 앞쪽 삽입만 일어나므로 head 스냅숏 이후에는 락 없이 따라가도 안전하다
@@ -329,8 +357,11 @@ void ProfileDataOutText(const char* szFileName)
 				mx = s.max[0];
 			}
 
-			fprintf(file, "%9lu | %-*.*s | %14.4f | %14.4f | %14.4f | %10lld\n",
-				(unsigned long)threadId, NAME_COL_W, NAME_COL_W, s.tag, avg, mn, mx, s.call);
+			fprintf(file, "%*lu | %-*.*s | %*.*f | %*.*f | %*.*f | %*lld\n",
+				W_TID, (unsigned long)threadId,
+				W_NAME, W_NAME, s.tag,
+				W_NUM, 4, avg, W_NUM, 4, mn, W_NUM, 4, mx,
+				W_CALL, s.call);
 		}
 	}
 	fprintf(file, "%s\n", dash);
@@ -342,12 +373,20 @@ void ProfileDataOutText(const char* szFileName)
 		for (int i = 0; i < g_errorCount; i++)
 			fprintf(file, "%s\n", g_errors[i]);
 		if (g_errorTotal > MAX_ERRORS)
-			fprintf(file, "(오류 %lld건 중 %lld건은 기록 한도 초과로 생략됨)\n",
-				g_errorTotal, g_errorTotal - MAX_ERRORS);
+			fprintf(file, "(%lld errors total; %lld omitted beyond the %d-entry limit)\n",
+				g_errorTotal, g_errorTotal - MAX_ERRORS, MAX_ERRORS);
 	}
 	ReleaseSRWLockShared(&g_errorLock);
 
 	fclose(file);
+
+	// 완성된 임시 파일을 최종 파일로 원자 교체
+	if (!MoveFileExA(tmpName, szFileName, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+	{
+		fprintf(stderr, "Profile: failed to replace '%s' (error %lu); report left in '%s'\n",
+			szFileName, GetLastError(), tmpName);
+	}
+
 	ReleaseSRWLockExclusive(&g_printLock);
 }
 
